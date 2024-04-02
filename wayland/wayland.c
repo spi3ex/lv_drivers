@@ -236,6 +236,8 @@ struct window
     bool closed;
     bool maximized;
     bool fullscreen;
+    uint64_t frame_counter;
+    bool frame_done;
 };
 
 /*********************************
@@ -243,6 +245,48 @@ struct window
  *********************************/
 
 static struct application application;
+
+static const struct wl_callback_listener wl_surface_frame_listener;
+static bool resize_window(struct window *window, int width, int height);
+static struct graphic_object * create_graphic_obj(struct application *app, struct window *window,
+                                                  enum object_type type,
+                                                  struct graphic_object *parent);
+
+/**
+ * @brief The frame callback called when the compositor has finished rendering
+ * a frame.It increments the frame counter and sets up the callback
+ * for the next frame the frame counter is used to avoid needlessly
+ * committing frames too fast on a slow system
+ *
+ * NOTE: this function is invoked by the wayland-server library within the compositor
+ * the event is added to the queue, and then upon the next timer call it's
+ * called indirectly from _lv_wayland_handle_input (via wl_display_dispatch_queue)
+ * @param void data the user object defined that was tied to this event during
+ * the configuration of the callback
+ * @param struct wl_callback The callback that needs to be destroyed and re-created
+ * @param time Timestamp of the event (unused)
+ */
+static void graphic_obj_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    struct graphic_object *obj;
+    struct window *window;
+
+    wl_callback_destroy(cb);
+
+    obj = (struct graphic_object*)data;
+    window = obj->window;
+    window->frame_counter++;
+
+    LV_LOG_TRACE("frame: %ld done, new frame: %ld",
+            window->frame_counter-1, window->frame_counter);
+
+    window->frame_done = true;
+
+}
+
+static const struct wl_callback_listener wl_surface_frame_listener = {
+    .done = graphic_obj_frame_done,
+};
 
 static inline bool _is_digit(char ch)
 {
@@ -1046,6 +1090,39 @@ static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_handle_capabilities,
 };
 
+static void draw_window(struct window *window, uint32_t width, uint32_t height) {
+
+#if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
+    if (application.opt_disable_decorations == false)
+    {
+        int d;
+        for (d = 0; d < NUM_DECORATIONS; d++)
+        {
+            window->decoration[d] = create_graphic_obj(&application, window, (FIRST_DECORATION+d), window->body);
+            if (!window->decoration[d])
+            {
+                LV_LOG_ERROR("Failed to create decoration %d", d);
+            }
+        }
+    }
+#endif
+
+    /* First resize */
+    if (!resize_window(window, width, height))
+    {
+        LV_LOG_ERROR("Failed to resize window");
+#if LV_WAYLAND_XDG_SHELL
+        if (window->xdg_toplevel)
+        {
+            xdg_toplevel_destroy(window->xdg_toplevel);
+        }
+#endif
+    }
+
+    lv_refr_now(window->lv_disp);
+
+}
+
 #if LV_WAYLAND_WL_SHELL
 static void wl_shell_handle_ping(void *data, struct wl_shell_surface *shell_surface, uint32_t serial)
 {
@@ -1056,6 +1133,7 @@ static void wl_shell_handle_configure(void *data, struct wl_shell_surface *shell
                                       uint32_t edges, int32_t width, int32_t height)
 {
     struct window *window = (struct window *)data;
+
 
     if ((width <= 0) || (height <= 0))
     {
@@ -1083,15 +1161,9 @@ static void xdg_surface_handle_configure(void *data, struct xdg_surface *xdg_sur
 
     xdg_surface_ack_configure(xdg_surface, serial);
 
-    if ((!window->body->surface_configured) &&
-        (window->body->pending_buffer != NULL)) {
-       // LVGL flush occured before surface was configured, so attach pending buffer here
-       wl_buf = SMM_BUFFER_PROPERTIES(window->body->pending_buffer)->tag[TAG_LOCAL];
-       window->body->pending_buffer = NULL;
-
-       wl_surface_attach(window->body->surface, wl_buf, 0, 0);
-       wl_surface_commit(window->body->surface);
-       window->flush_pending = true;
+    if (window->body->surface_configured == false)
+    {
+        draw_window(window, window->width, window->height);
     }
 
     window->body->surface_configured = true;
@@ -1158,7 +1230,7 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .configure = xdg_toplevel_handle_configure,
     .close = xdg_toplevel_handle_close,
     .configure_bounds = xdg_toplevel_handle_configure_bounds,
-    .wm_capabilities = xdg_toplevel_handle_wm_capabilities
+    .wm_capabilities = xdg_toplevel_handle_wm_capabilities /* This requires newer wayland headers */
 };
 
 static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial)
@@ -1222,6 +1294,19 @@ static const struct wl_registry_listener registry_listener = {
 
 static void handle_wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
+    void *userdata;
+    const struct smm_buffer_properties *props;
+    struct graphic_object *obj;
+    struct window *window;
+    smm_buffer_t *buf;
+
+    buf = (smm_buffer_t *)data;
+    props = SMM_BUFFER_PROPERTIES(buf);
+    obj = SMM_GROUP_PROPERTIES(props->group)->tag[TAG_LOCAL];
+    window = obj->window;
+
+    LV_LOG_TRACE("releasing buffer %p w:%d h:%d frame: %ld", wl_buffer, obj->width,
+            obj->height, window->frame_counter);
     smm_release((smm_buffer_t *)data);
 }
 
@@ -1574,18 +1659,19 @@ static bool attach_decoration(struct window *window, struct graphic_object * dec
         return false;
     }
 
-    decoration->subsurface = wl_subcompositor_get_subsurface(window->application->subcompositor,
-                                                             decoration->surface,
-                                                             parent->surface);
-    if (!decoration->subsurface)
-    {
-        LV_LOG_ERROR("cannot get subsurface for decoration");
-        goto err_destroy_surface;
+    if(decoration->subsurface == NULL) {
+        /* Create the subsurface only once */
+        decoration->subsurface = wl_subcompositor_get_subsurface(window->application->subcompositor,
+                                                                 decoration->surface,
+                                                                 parent->surface);
+        if (!decoration->subsurface)
+        {
+            LV_LOG_ERROR("cannot get subsurface for decoration");
+            goto err_destroy_surface;
+        }
     }
 
-    wl_subsurface_set_desync(decoration->subsurface);
     wl_subsurface_set_position(decoration->subsurface, pos_x, pos_y);
-
     wl_surface_attach(decoration->surface, wl_buf, 0, 0);
     wl_surface_commit(decoration->surface);
 
@@ -1603,6 +1689,7 @@ static bool create_decoration(struct window *window,
                               int window_width, int window_height)
 {
     smm_buffer_t *buf;
+    smm_buffer_t *buf2;
     void *buf_base;
     int x, y;
 
@@ -1651,6 +1738,7 @@ static bool create_decoration(struct window *window,
                (decoration->width * BYTES_PER_PIXEL) * decoration->height);
 
     buf = smm_acquire(decoration->buffer_group);
+
     if (buf == NULL)
     {
         LV_LOG_ERROR("cannot allocate buffer for decoration");
@@ -1762,28 +1850,37 @@ static void detach_decoration(struct window *window,
 static bool resize_window(struct window *window, int width, int height)
 {
     lv_color_t * buf1 = NULL;
-
-    LV_LOG_TRACE("resize window %dx%d", width, height);
-
-#if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
+    struct smm_buffer_t *body_buf1;
+    struct smm_buffer_t *body_buf2;
     int b;
-    for (b = 0; b < NUM_DECORATIONS; b++)
-    {
-        if (window->decoration[b] != NULL)
-        {
-            detach_decoration(window, window->decoration[b]);
-        }
-    }
-#endif
+
+    LV_LOG_TRACE("resize window %dx%d frame: %ld rendered: %d",
+            width, height, window->frame_counter, window->frame_done);
 
     /* Update size for newly allocated buffers */
-    smm_resize(window->body->buffer_group, (width * BYTES_PER_PIXEL) * height);
+    smm_resize(window->body->buffer_group, ((width * BYTES_PER_PIXEL) * height) * 2);
 
     window->width = width;
     window->height = height;
 
     window->body->width = width;
     window->body->height = height;
+
+    /* Pre-allocate two buffers for the window body here */
+    body_buf1 = smm_acquire(window->body->buffer_group);
+    body_buf2 = smm_acquire(window->body->buffer_group);
+
+    if (smm_map(body_buf2) == NULL)
+    {
+        LV_LOG_ERROR("Cannot pre-allocate backing buffers for window body");
+        wl_surface_destroy(window->body->surface);
+        return false;
+    }
+
+    /* Moves the buffers to the the unused list of the group */
+    smm_release(body_buf1);
+    smm_release(body_buf2);
+
 
 #if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
     if (!window->application->opt_disable_decorations && !window->fullscreen)
@@ -1796,6 +1893,17 @@ static bool resize_window(struct window *window, int width, int height)
                 LV_LOG_ERROR("failed to create decoration %d", b);
             }
         }
+
+    }
+    else if (!window->application->opt_disable_decorations)
+    {
+        /* Entering fullscreen, detach decorations to prevent xdg_wm_base error 4 */
+        /* requested geometry larger than the configured fullscreen state */
+        for (b = 0; b < NUM_DECORATIONS; b++)
+        {
+            detach_decoration(window, window->decoration[b]);
+        }
+
     }
 #endif
 
@@ -1841,6 +1949,9 @@ static struct window *create_window(struct application *app, int width, int heig
 
     // Create wayland buffer and surface
     window->body = create_graphic_obj(app, window, OBJECT_WINDOW, NULL);
+    window->width = width;
+    window->height = height;
+
     if (!window->body)
     {
         LV_LOG_ERROR("cannot create window body");
@@ -1880,6 +1991,9 @@ static struct window *create_window(struct application *app, int width, int heig
         // configure event
         window->body->surface_configured = false;
         wl_surface_commit(window->body->surface);
+        /* Manually dispatching the queue is required to */
+        /* ensure that configure gets called right away. */
+        wl_display_dispatch(application.display);
     }
 #endif
 #if LV_WAYLAND_WL_SHELL
@@ -1895,6 +2009,9 @@ static struct window *create_window(struct application *app, int width, int heig
         wl_shell_surface_add_listener(window->wl_shell_surface, &shell_surface_listener, window);
         wl_shell_surface_set_toplevel(window->wl_shell_surface);
         wl_shell_surface_set_title(window->wl_shell_surface, title);
+
+        /* For wl_shell, just draw the window, weston doesn't send it */
+        draw_window(window, window->width, window->height);
     }
 #endif
     else
@@ -1903,36 +2020,8 @@ static struct window *create_window(struct application *app, int width, int heig
         goto err_destroy_surface;
     }
 
-#if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
-    if (!app->opt_disable_decorations)
-    {
-        int d;
-        for (d = 0; d < NUM_DECORATIONS; d++)
-        {
-            window->decoration[d] = create_graphic_obj(app, window, (FIRST_DECORATION+d), window->body);
-            if (!window->decoration[d])
-            {
-                LV_LOG_ERROR("Failed to create decoration %d", d);
-            }
-        }
-    }
-#endif
-
-    if (!resize_window(window, width, height))
-    {
-        LV_LOG_ERROR("Failed to resize window");
-        goto err_destroy_shell_surface2;
-    }
 
     return window;
-
-err_destroy_shell_surface2:
-#if LV_WAYLAND_XDG_SHELL
-    if (window->xdg_toplevel)
-    {
-        xdg_toplevel_destroy(window->xdg_toplevel);
-    }
-#endif
 
 err_destroy_shell_surface:
 #if LV_WAYLAND_WL_SHELL
@@ -2004,6 +2093,7 @@ static void _lv_wayland_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv
     lv_coord_t src_height = (area->y2 - area->y1 + 1);
     struct window *window = disp_drv->user_data;
     smm_buffer_t *buf = window->body->pending_buffer;
+    struct wl_callback *cb;
 
     const lv_coord_t hres = (disp_drv->rotated == 0) ? (disp_drv->hor_res) : (disp_drv->ver_res);
     const lv_coord_t vres = (disp_drv->rotated == 0) ? (disp_drv->ver_res) : (disp_drv->hor_res);
@@ -2016,11 +2106,6 @@ static void _lv_wayland_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv
     /* Skip if the area is out the screen */
     else if ((area->x2 < 0) || (area->y2 < 0) || (area->x1 > hres - 1) || (area->y1 > vres - 1))
     {
-        goto skip;
-    }
-    else if (window->resize_pending)
-    {
-        LV_LOG_TRACE("skip flush since resize is pending");
         goto skip;
     }
 
@@ -2080,18 +2165,22 @@ static void _lv_wayland_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv
 
     if (lv_disp_flush_is_last(disp_drv))
     {
-        if (window->body->surface_configured) {
-            /* Finally, attach buffer and commit to surface */
-            wl_buf = SMM_BUFFER_PROPERTIES(buf)->tag[TAG_LOCAL];
-            wl_surface_attach(window->body->surface, wl_buf, 0, 0);
-            wl_surface_commit(window->body->surface);
-            window->body->pending_buffer = NULL;
-        }
+        /* Finally, attach buffer and commit to surface */
+        wl_buf = SMM_BUFFER_PROPERTIES(buf)->tag[TAG_LOCAL];
+        wl_surface_attach(window->body->surface, wl_buf, 0, 0);
+        wl_surface_commit(window->body->surface);
+        window->body->pending_buffer = NULL;
+        window->frame_done = false;
+
+        cb = wl_surface_frame(window->body->surface);
+        wl_callback_add_listener(cb, &wl_surface_frame_listener, window->body);
+        LV_LOG_TRACE("last flush frame: %ld", window->frame_counter);
 
         window->flush_pending = true;
     }
 
-   goto done;
+    lv_disp_flush_ready(disp_drv);
+    return;
 skip:
     if (buf != NULL) {
         /* Cleanup any intermediate state (in the event that this flush being
@@ -2102,8 +2191,6 @@ skip:
         smm_release(buf);
         window->body->pending_buffer = NULL;
     }
-done:
-    lv_disp_flush_ready(disp_drv);
 }
 
 static void _lv_wayland_handle_input(void)
@@ -2165,16 +2252,6 @@ static void _lv_wayland_handle_output(void)
                 window->application->keyboard_obj = NULL;
             }
             destroy_window(window);
-        }
-        else if (window->resize_pending)
-        {
-            if (resize_window(window, window->resize_width, window->resize_height))
-            {
-                window->resize_width = window->width;
-                window->resize_height = window->height;
-                window->resize_pending = false;
-                shall_flush = true;
-            }
         }
 
         shall_flush |= window->flush_pending;
@@ -2675,12 +2752,36 @@ uint32_t lv_wayland_timer_handler(void)
     lv_timer_t *input_timer[4];
     uint32_t time_till_next;
 
-    /* Wayland input handling */
+    /* Wayland input handling - it will also trigger the frame done handler */
     _lv_wayland_handle_input();
 
     /* Ready input timers (to probe for any input recieved) */
     _LV_LL_READ(&application.window_ll, window)
     {
+        LV_LOG_TRACE("handle timer frame: %ld", window->frame_counter);
+
+        if (window != NULL && window->frame_done == false
+                && window->frame_counter > 0)
+        {
+            LV_LOG_TRACE("LVGL is going too fast or window is hidden");
+            return LV_DISP_DEF_REFR_PERIOD;
+        }
+        else if (window != NULL &&
+                window->resize_pending && window->frame_counter > 0)
+        {
+            if (resize_window(window, window->resize_width, window->resize_height))
+            {
+                window->resize_width = window->width;
+                window->resize_height = window->height;
+                window->resize_pending = false;
+
+            } else {
+
+                LV_LOG_TRACE("Failed to resize window frame: %ld",
+                        window->frame_counter);
+            }
+        }
+
         input_timer[0] = window->lv_indev_pointer->driver->read_timer;
         input_timer[1] = window->lv_indev_pointeraxis->driver->read_timer;
         input_timer[2] = window->lv_indev_keyboard->driver->read_timer;
